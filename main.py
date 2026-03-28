@@ -16,7 +16,7 @@ from api.config import router as config_router
 from api.actions import router as actions_router
 from api.integrations import router as integrations_router
 
-EXPECTED_CONDA_ENV = os.getenv("APP_CONDA_ENV", "any-auto-register")
+EXPECTED_CONDA_ENV = "any-auto-register"
 
 
 def _detect_conda_env() -> str:

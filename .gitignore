@@ -1,4 +1,5 @@
 # Python
+start2.sh
 .venv/
 __pycache__/
 *.pyc
