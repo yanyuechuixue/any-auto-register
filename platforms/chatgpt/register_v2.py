@@ -96,6 +96,7 @@ class OAuthPkceRegisterStrategy:
         result.email = email_addr
         result.password = password
         log(f"邮箱: {email_addr}")
+        log(f"密码: {password}")
 
         # ── 步骤 3：初始化 OAuth 会话 ────────────────────────────────────
         log("步骤 3/12: 访问 OAuth 授权 URL，获取 oai-did...")
@@ -141,7 +142,24 @@ class OAuthPkceRegisterStrategy:
 
         # ── 步骤 10：注册后重新 OAuth 登录 ───────────────────────────────
         log("步骤 10/12: 注册后重新 OAuth 登录...")
-        login_oauth = client.login_after_register(email_addr, password, otp_code)
+
+        def _login_otp_callback() -> str:
+            """在登录阶段需要新验证码时，从邮箱实时获取。"""
+            login_otp_sent_at = time.time()
+            log("步骤 10/12: 等待登录验证码（最多 120s）...")
+            code = email_service.wait_for_verification_code(
+                email_addr,
+                timeout=120,
+                otp_sent_at=login_otp_sent_at,
+            )
+            if code:
+                log(f"登录验证码: {code}")
+            return code or ""
+
+        login_oauth = client.login_after_register(
+            email_addr, password, otp_code,
+            otp_callback=_login_otp_callback,
+        )
 
         # ── 步骤 11：解析 workspace_id ───────────────────────────────────
         log("步骤 11/12: 解析 workspace_id...")

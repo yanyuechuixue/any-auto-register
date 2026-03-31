@@ -9,7 +9,7 @@ import json
 import re
 import time
 import urllib.parse
-from typing import Optional
+from typing import Callable, Optional
 
 from curl_cffi import requests as curl_requests
 
@@ -279,13 +279,19 @@ class OAuthPkceClient:
     # ══════════════════════════════════════════════════════════════════
 
     def login_after_register(
-        self, email: str, password: str, otp_code: str = ""
+        self, email: str, password: str, otp_code: str = "",
+        otp_callback: Optional[Callable[[], str]] = None,
     ) -> OAuthStart:
         """
         注册完成后重走 OAuth 登录流程。
 
         注册阶段的 session 不含 workspace 信息，必须重新走一次
         OAuth 登录获取 oai-client-auth-session Cookie。
+
+        Args:
+            otp_callback: 可选的回调函数，无参数，返回登录阶段所需的新验证码字符串（空字符串
+                          表示获取失败）。优先于 otp_code 使用，在登录需要 OTP 时从邮箱实时
+                          获取新验证码，而非复用注册阶段的旧验证码。
 
         Returns:
             登录阶段的 OAuthStart（含 code_verifier 等，用于步骤 12 Token 交换）。
@@ -342,12 +348,9 @@ class OAuthPkceClient:
             page_type = (pwd_resp.json().get("page") or {}).get("type", "")
             self._log(f"密码验证后页面类型: {page_type}")
 
-        # 9-5. 二次 OTP（复用注册阶段验证码）
+        # 9-5. 登录阶段 OTP 验证
         if "otp" in page_type or "verification" in page_type:
-            if not otp_code:
-                raise RuntimeError("登录需要二次 OTP 验证，但未提供验证码")
-            self._log(f"提交登录二次验证码: {otp_code}")
-            # 触发发信请求以满足后端状态机（可忽略报错）
+            # 触发发信请求，让服务端向邮箱发送新的登录验证码
             try:
                 self.session.post(
                     f"{AUTH_BASE}/api/accounts/passwordless/send-otp",
@@ -361,6 +364,18 @@ class OAuthPkceClient:
             except Exception:
                 pass
 
+            # 优先使用回调获取新验证码，回退至复用注册阶段验证码
+            if otp_callback is not None:
+                self._log("等待登录验证码...")
+                fresh_otp = otp_callback()
+                if not fresh_otp:
+                    raise RuntimeError("未获取到登录验证码")
+            else:
+                if not otp_code:
+                    raise RuntimeError("登录需要二次 OTP 验证，但未提供验证码")
+                fresh_otp = otp_code
+
+            self._log(f"提交登录验证码: {fresh_otp}")
             otp_resp = self.session.post(
                 f"{AUTH_BASE}/api/accounts/email-otp/validate",
                 headers={
@@ -369,12 +384,12 @@ class OAuthPkceClient:
                     "content-type": "application/json",
                     "openai-sentinel-token": login_sentinel,
                 },
-                data=json.dumps({"code": otp_code}),
+                data=json.dumps({"code": fresh_otp}),
                 timeout=30,
             )
             if otp_resp.status_code != 200:
-                raise RuntimeError(f"登录二次 OTP 失败: HTTP {otp_resp.status_code} {otp_resp.text[:200]}")
-            self._log("登录二次验证通过")
+                raise RuntimeError(f"登录 OTP 失败: HTTP {otp_resp.status_code} {otp_resp.text[:200]}")
+            self._log("登录 OTP 验证通过")
 
         self._log("OAuth 登录流程完成")
         return login_oauth
