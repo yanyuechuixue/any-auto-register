@@ -262,6 +262,14 @@ def create_mailbox(
             domain=extra.get("gptmail_domain", ""),
             proxy=proxy,
         )
+    elif provider == "applemail":
+        return AppleMailMailbox(
+            api_url=extra.get("applemail_base_url", "https://www.appleemail.top"),
+            pool_file=extra.get("applemail_pool_file", ""),
+            pool_dir=extra.get("applemail_pool_dir", "mail"),
+            mailboxes=extra.get("applemail_mailboxes", "INBOX,Junk"),
+            proxy=proxy,
+        )
     elif provider == "cfworker":
         return CFWorkerMailbox(
             api_url=extra.get("cfworker_api_url", ""),
@@ -289,6 +297,313 @@ def create_mailbox(
             auth_token=extra.get("laoudo_auth", ""),
             email=extra.get("laoudo_email", ""),
             account_id=extra.get("laoudo_account_id", ""),
+        )
+
+
+class AppleMailMailbox(BaseMailbox):
+    """小苹果取件邮箱服务，基于本地邮箱池文件轮转邮箱账号"""
+
+    def __init__(
+        self,
+        api_url: str = "https://www.appleemail.top",
+        pool_file: str = "",
+        pool_dir: str = "mail",
+        mailboxes: str = "INBOX,Junk",
+        proxy: str = None,
+    ):
+        self.api = (api_url or "https://www.appleemail.top").rstrip("/")
+        self.pool_file = str(pool_file or "").strip()
+        self.pool_dir = str(pool_dir or "mail").strip() or "mail"
+        self.mailboxes = self._normalize_mailboxes(mailboxes)
+        self.proxy = build_requests_proxy_config(proxy)
+        self._email = None
+        self._selected_record = None
+        self._selected_pool_path = None
+
+    @staticmethod
+    def _normalize_mailboxes(value: Any) -> list[str]:
+        if isinstance(value, (list, tuple, set)):
+            items = [str(item or "").strip() for item in value]
+        else:
+            raw = str(value or "INBOX,Junk").strip() or "INBOX,Junk"
+            items = [item.strip() for item in raw.split(",")]
+
+        result = []
+        seen = set()
+        for item in items:
+            if not item:
+                continue
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result or ["INBOX", "Junk"]
+
+    def _headers(self) -> dict[str, str]:
+        return {"accept": "application/json"}
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: dict[str, Any],
+        timeout: int = 15,
+    ) -> Any:
+        import requests
+
+        response = requests.request(
+            method,
+            f"{self.api}{path}",
+            params=None,
+            json=payload,
+            headers=self._headers(),
+            proxies=self.proxy,
+            timeout=timeout,
+        )
+        try:
+            data = response.json()
+        except Exception as exc:
+            preview = (response.text or "")[:200]
+            raise RuntimeError(
+                f"AppleMail API {path} 返回非 JSON: HTTP {response.status_code} {preview}"
+            ) from exc
+
+        if response.status_code >= 400:
+            if isinstance(data, dict):
+                message = (
+                    data.get("detail")
+                    or data.get("message")
+                    or data.get("error")
+                    or response.text
+                )
+            else:
+                message = response.text
+            raise RuntimeError(
+                f"AppleMail API {path} 失败: {str(message or f'HTTP {response.status_code}').strip()}"
+            )
+
+        if isinstance(data, dict) and data.get("success") is False:
+            message = (
+                data.get("message")
+                or data.get("detail")
+                or data.get("error")
+                or "unknown error"
+            )
+            raise RuntimeError(f"AppleMail API {path} 失败: {str(message).strip()}")
+
+        return data
+
+    @staticmethod
+    def _unwrap_message_payload(payload: Any) -> list[dict[str, Any]]:
+        if payload is None:
+            return []
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict):
+            for key in ("data", "result", "results", "messages", "mails", "emails", "items", "list"):
+                if key in payload:
+                    nested = AppleMailMailbox._unwrap_message_payload(payload.get(key))
+                    if nested:
+                        return nested
+            if any(
+                key in payload
+                for key in (
+                    "id",
+                    "message_id",
+                    "uid",
+                    "mail_id",
+                    "subject",
+                    "content",
+                    "text",
+                    "html",
+                    "body",
+                    "preview",
+                    "verification_code",
+                    "code",
+                    "otp",
+                )
+            ):
+                return [payload]
+
+            collected = []
+            for value in payload.values():
+                collected.extend(AppleMailMailbox._unwrap_message_payload(value))
+            return collected
+        return []
+
+    @staticmethod
+    def _resolve_message_id(message: dict[str, Any], mailbox: str) -> str:
+        import hashlib
+
+        for key in ("id", "message_id", "uid", "mail_id", "mid", "_id"):
+            value = str(message.get(key) or "").strip()
+            if value:
+                return value
+
+        raw = json.dumps(message, ensure_ascii=False, sort_keys=True)
+        digest = hashlib.sha1(f"{mailbox}:{raw}".encode("utf-8")).hexdigest()
+        return f"{mailbox}:{digest}"
+
+    def _build_search_text(self, message: dict[str, Any]) -> str:
+        parts = []
+        for key in (
+            "subject",
+            "from",
+            "from_address",
+            "sender",
+            "preview",
+            "text",
+            "content",
+            "body",
+            "html",
+            "html_content",
+            "raw",
+            "raw_content",
+            "mail_text",
+        ):
+            value = message.get(key)
+            if value:
+                parts.append(str(value))
+
+        if not parts:
+            parts.append(json.dumps(message, ensure_ascii=False))
+
+        text = " ".join(parts).strip()
+        return self._decode_raw_content(text) or text
+
+    def _extract_code_from_message(
+        self,
+        message: dict[str, Any],
+        code_pattern: str = None,
+    ) -> Optional[str]:
+        for key in ("verification_code", "code", "otp", "captcha", "verify_code"):
+            value = str(message.get(key) or "").strip()
+            if value:
+                code = self._safe_extract(value, code_pattern)
+                if code:
+                    return code
+        return self._safe_extract(self._build_search_text(message), code_pattern)
+
+    def _resolve_mailboxes_for_account(self, account: MailboxAccount) -> list[str]:
+        account_mailbox = ""
+        if isinstance(account.extra, dict):
+            account_mailbox = str(account.extra.get("mailbox") or "").strip()
+
+        result = []
+        seen = set()
+        for mailbox in ([account_mailbox] if account_mailbox else []) + list(self.mailboxes):
+            name = str(mailbox or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            result.append(name)
+        return result or ["INBOX"]
+
+    def _build_request_payload(self, account: MailboxAccount, mailbox: str) -> dict[str, Any]:
+        extra = account.extra or {}
+        refresh_token = str(extra.get("refresh_token") or "").strip()
+        client_id = str(extra.get("client_id") or "").strip()
+        if not refresh_token or not client_id:
+            raise RuntimeError("AppleMail 邮箱记录缺少 refresh_token 或 client_id")
+
+        return {
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "email": account.email,
+            "mailbox": mailbox,
+        }
+
+    def _list_messages(self, account: MailboxAccount, mailbox: str) -> list[dict[str, Any]]:
+        data = self._request_json(
+            "POST",
+            "/api/mail-all",
+            payload=self._build_request_payload(account, mailbox),
+            timeout=15,
+        )
+        return self._unwrap_message_payload(data)
+
+    def get_email(self) -> MailboxAccount:
+        from .applemail_pool import take_next_applemail_record
+
+        pool_path, record = take_next_applemail_record(
+            pool_file=self.pool_file,
+            pool_dir=self.pool_dir,
+        )
+        self._selected_pool_path = pool_path
+        self._selected_record = record
+        self._email = record["email"]
+        self._log(f"[AppleMail] 使用邮箱池: {pool_path.name}")
+        self._log(f"[AppleMail] 分配邮箱: {record['email']}")
+        return MailboxAccount(
+            email=record["email"],
+            account_id=record["email"],
+            extra={
+                "provider": "applemail",
+                "client_id": record["client_id"],
+                "refresh_token": record["refresh_token"],
+                "mailbox": record.get("mailbox") or "INBOX",
+                "pool_file": pool_path.name,
+            },
+        )
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        ids = set()
+        for mailbox in self._resolve_mailboxes_for_account(account):
+            try:
+                messages = self._list_messages(account, mailbox)
+            except Exception:
+                continue
+            ids.update(
+                self._resolve_message_id(message, mailbox)
+                for message in messages
+            )
+        return ids
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 120,
+        before_ids: set = None,
+        code_pattern: str = None,
+        **kwargs,
+    ) -> str:
+        seen = {str(mid) for mid in (before_ids or set())}
+        exclude_codes = {
+            str(code).strip()
+            for code in (kwargs.get("exclude_codes") or set())
+            if str(code or "").strip()
+        }
+
+        def poll_once() -> Optional[str]:
+            for mailbox in self._resolve_mailboxes_for_account(account):
+                try:
+                    messages = self._list_messages(account, mailbox)
+                except Exception:
+                    continue
+
+                for message in messages:
+                    message_id = self._resolve_message_id(message, mailbox)
+                    if message_id in seen:
+                        continue
+                    seen.add(message_id)
+
+                    search_text = self._build_search_text(message)
+                    if keyword and keyword.lower() not in search_text.lower():
+                        continue
+
+                    code = self._extract_code_from_message(message, code_pattern)
+                    if code and code in exclude_codes:
+                        continue
+                    if code:
+                        self._log(f"[AppleMail] {mailbox} 收到验证码: {code}")
+                        return code
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=3,
+            poll_once=poll_once,
         )
 
 

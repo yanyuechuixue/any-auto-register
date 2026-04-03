@@ -19,6 +19,7 @@ import { apiFetch } from '@/lib/utils'
 const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   mail_provider: [
     { label: 'LuckMail（订单接码 / 已购邮箱）', value: 'luckmail' },
+    { label: 'AppleMail（小苹果 / 本地邮箱池）', value: 'applemail' },
     { label: 'Laoudo（固定邮箱）', value: 'laoudo' },
     { label: 'TempMail.lol（自动生成）', value: 'tempmail_lol' },
     { label: 'SkyMail（CloudMail 接口）', value: 'skymail' },
@@ -118,6 +119,16 @@ const TAB_ITEMS = [
           { key: 'maliapi_api_key', label: 'API Key', secret: true },
           { key: 'maliapi_domain', label: '邮箱域名（可选）', placeholder: 'example.com' },
           { key: 'maliapi_auto_domain_strategy', label: '自动域名策略', type: 'select' },
+        ],
+      },
+      {
+        title: 'AppleMail / 小苹果',
+        desc: '读取本地邮箱池文件，通过 refresh_token + client_id 调用小苹果取件接口；支持在本页直接导入 JSON',
+        fields: [
+          { key: 'applemail_base_url', label: 'API URL', placeholder: 'https://www.appleemail.top' },
+          { key: 'applemail_pool_dir', label: '邮箱池目录', placeholder: 'mail' },
+          { key: 'applemail_pool_file', label: '当前邮箱池文件（可选）', placeholder: '留空则自动读取目录中最新文件' },
+          { key: 'applemail_mailboxes', label: '轮询文件夹', placeholder: 'INBOX,Junk' },
         ],
       },
       {
@@ -551,6 +562,76 @@ function CFWorkerDomainPoolSection({ form }: { form: any }) {
       <Typography.Text type="secondary" style={{ display: 'block', marginTop: 12 }}>
         仅已启用域名会参与注册；点击已启用标签可直接移除。
       </Typography.Text>
+    </Card>
+  )
+}
+
+function AppleMailPoolImportSection({ form }: { form: any }) {
+  const [content, setContent] = useState('')
+  const [filename, setFilename] = useState('')
+  const [importing, setImporting] = useState(false)
+
+  const handleImport = async () => {
+    if (!content.trim()) {
+      message.error('请输入 JSON 内容')
+      return
+    }
+
+    setImporting(true)
+    try {
+      const poolDir = String(form.getFieldValue('applemail_pool_dir') || 'mail').trim() || 'mail'
+      const result = await apiFetch('/config/applemail/import', {
+        method: 'POST',
+        body: JSON.stringify({
+          content,
+          filename,
+          pool_dir: poolDir,
+          bind_to_config: true,
+        }),
+      })
+
+      form.setFieldsValue({
+        mail_provider: 'applemail',
+        applemail_pool_dir: result.pool_dir,
+        applemail_pool_file: result.filename,
+      })
+      setContent('')
+      setFilename('')
+      message.success(`AppleMail JSON 导入成功，共 ${result.count} 条，已绑定 ${result.filename}`)
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'AppleMail JSON 导入失败'
+      message.error(errorMessage || 'AppleMail JSON 导入失败')
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  return (
+    <Card
+      title="AppleMail JSON 导入"
+      extra={<span style={{ fontSize: 12, color: '#7a8ba3' }}>导入后会自动写入 mail 目录并绑定为当前邮箱池文件</span>}
+      style={{ marginBottom: 16 }}
+    >
+      <Space direction="vertical" style={{ width: '100%' }} size={12}>
+        <Typography.Text type="secondary">
+          支持数组或对象包装结构，常见字段别名如 `clientId` / `refreshToken` / `folder` 会自动规范化成 `client_id` / `refresh_token` / `mailbox`。
+        </Typography.Text>
+        <Input
+          value={filename}
+          onChange={(event) => setFilename(event.target.value)}
+          placeholder="可选文件名，例如 applemail_hotmail.json；留空自动生成"
+        />
+        <Input.TextArea
+          value={content}
+          onChange={(event) => setContent(event.target.value)}
+          rows={10}
+          placeholder={'[\n  {\n    "email": "demo@example.com",\n    "clientId": "xxxx",\n    "refreshToken": "xxxx",\n    "folder": "INBOX"\n  }\n]'}
+          style={{ fontFamily: 'monospace' }}
+        />
+        <Button type="primary" onClick={handleImport} loading={importing}>
+          导入 JSON 到邮箱池
+        </Button>
+      </Space>
     </Card>
   )
 }
@@ -1049,6 +1130,15 @@ export default function Settings() {
       if (!data.mail_provider) {
         data.mail_provider = 'luckmail'
       }
+      if (!data.applemail_base_url) {
+        data.applemail_base_url = 'https://www.appleemail.top'
+      }
+      if (!data.applemail_pool_dir) {
+        data.applemail_pool_dir = 'mail'
+      }
+      if (!data.applemail_mailboxes) {
+        data.applemail_mailboxes = 'INBOX,Junk'
+      }
       if (!data.gptmail_base_url) {
         data.gptmail_base_url = 'https://mail.chatgpt.org.uk'
       }
@@ -1138,6 +1228,7 @@ export default function Settings() {
               {currentTab.sections.map((section) => (
                 <ConfigSection key={section.title} section={section} />
               ))}
+              {activeTab === 'mailbox' ? <AppleMailPoolImportSection form={form} /> : null}
               {activeTab === 'mailbox' ? <CFWorkerDomainPoolSection form={form} /> : null}
               <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} block>
                 {saved ? '已保存 ✓' : '保存配置'}
